@@ -5,22 +5,27 @@ import { Writable } from "node:stream";
 import type { ChildProcess } from "node:child_process";
 import { runAdvisor, type Spawner } from "../src/advisor.js";
 
-/**
- * Builds a fake ChildProcess that records stdin writes and lets the test
- * drive stdout/stderr/close events deterministically.
- */
-function makeFakeChild(): {
+interface FakeChild {
   child: ChildProcess;
   stdinChunks: string[];
   emitStdout: (text: string) => void;
   emitStderr: (text: string) => void;
+  emitStdinError: (err: Error) => void;
   close: (code: number) => void;
   error: (err: Error) => void;
-} {
+  killSignals: NodeJS.Signals[];
+}
+
+/**
+ * Builds a fake ChildProcess that records stdin writes and kill signals and
+ * lets the test drive stdout/stderr/close/error events deterministically.
+ */
+function makeFakeChild(): FakeChild {
   const emitter = new EventEmitter() as EventEmitter & Partial<ChildProcess>;
   const stdout = new EventEmitter();
   const stderr = new EventEmitter();
   const stdinChunks: string[] = [];
+  const killSignals: NodeJS.Signals[] = [];
 
   const stdin = new Writable({
     write(chunk, _enc, cb) {
@@ -29,18 +34,25 @@ function makeFakeChild(): {
     },
   });
 
-  (emitter as unknown as { stdout: EventEmitter }).stdout = stdout;
-  (emitter as unknown as { stderr: EventEmitter }).stderr = stderr;
-  (emitter as unknown as { stdin: Writable }).stdin = stdin;
-  (emitter as unknown as { kill: () => void }).kill = () => {};
+  Object.assign(emitter, {
+    stdout,
+    stderr,
+    stdin,
+    kill: (signal: NodeJS.Signals) => {
+      killSignals.push(signal);
+      return true;
+    },
+  });
 
   return {
     child: emitter as unknown as ChildProcess,
     stdinChunks,
     emitStdout: (t) => stdout.emit("data", Buffer.from(t)),
     emitStderr: (t) => stderr.emit("data", Buffer.from(t)),
+    emitStdinError: (err) => stdin.emit("error", err),
     close: (code) => emitter.emit("close", code),
     error: (err) => emitter.emit("error", err),
+    killSignals,
   };
 }
 
@@ -137,4 +149,94 @@ test("runAdvisor passes a custom model through to argv", async () => {
 
   await promise;
   assert.deepEqual(capturedArgs, ["-p", "--model", "claude-opus-4-6"]);
+});
+
+test("runAdvisor rejects on stdin error (EPIPE) without crashing", async () => {
+  const fake = makeFakeChild();
+  const spawner: Spawner = () => fake.child;
+
+  const promise = runAdvisor({
+    model: "opus",
+    prompt: "p",
+    spawner,
+  });
+
+  // Simulate the child exiting before reading all of stdin.
+  fake.emitStdinError(Object.assign(new Error("write EPIPE"), { code: "EPIPE" }));
+
+  await assert.rejects(promise, /EPIPE/);
+});
+
+test("runAdvisor rejects when output exceeds maxOutputBytes and kills the child", async () => {
+  const fake = makeFakeChild();
+  const spawner: Spawner = () => fake.child;
+
+  const promise = runAdvisor({
+    model: "opus",
+    prompt: "p",
+    spawner,
+    maxOutputBytes: 16,
+  });
+
+  fake.emitStdout("x".repeat(32));
+
+  await assert.rejects(promise, /output exceeded 16 bytes/);
+  assert.ok(
+    fake.killSignals.includes("SIGKILL"),
+    "expected SIGKILL after exceeding output budget",
+  );
+});
+
+test("runAdvisor rejects when exit is 0 but no stdout was produced", async () => {
+  const fake = makeFakeChild();
+  const spawner: Spawner = () => fake.child;
+
+  const promise = runAdvisor({
+    model: "opus",
+    prompt: "p",
+    spawner,
+  });
+
+  fake.close(0);
+
+  await assert.rejects(promise, /exited 0 with no output/);
+});
+
+test("runAdvisor sends SIGTERM immediately on timeout", async () => {
+  const fake = makeFakeChild();
+  const spawner: Spawner = () => fake.child;
+
+  await assert.rejects(
+    runAdvisor({
+      model: "opus",
+      prompt: "p",
+      spawner,
+      timeoutMs: 20,
+    }),
+    /timed out after 20ms/,
+  );
+
+  assert.ok(
+    fake.killSignals.includes("SIGTERM"),
+    "expected SIGTERM after timeout",
+  );
+});
+
+test("runAdvisor ignores late close events after settling once (idempotent)", async () => {
+  const fake = makeFakeChild();
+  const spawner: Spawner = () => fake.child;
+
+  const promise = runAdvisor({
+    model: "opus",
+    prompt: "p",
+    spawner,
+  });
+
+  fake.emitStdout("first");
+  fake.close(0);
+  // A second close (e.g. racing with a timeout) must not double-resolve.
+  fake.close(1);
+
+  const result = await promise;
+  assert.equal(result, "first");
 });

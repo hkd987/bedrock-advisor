@@ -12,14 +12,20 @@ export interface AdvisorConfig {
   enabled: boolean;
 }
 
+const DEFAULT_MAX_CALLS = 5;
+const DISABLED_VALUES = new Set(["false", "0", "no", "off"]);
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AdvisorConfig {
-  const rawMax = env.ADVISOR_MAX_CALLS;
-  const parsedMax = rawMax === undefined ? 5 : Number(rawMax);
-  const maxCalls = Number.isFinite(parsedMax) && parsedMax >= 0 ? parsedMax : 5;
+  const rawMax = env.ADVISOR_MAX_CALLS?.trim();
+  const parsedMax = rawMax ? Number(rawMax) : DEFAULT_MAX_CALLS;
+  const maxCalls =
+    Number.isInteger(parsedMax) && parsedMax >= 0 ? parsedMax : DEFAULT_MAX_CALLS;
+
+  const rawEnabled = env.ADVISOR_ENABLED?.trim().toLowerCase() ?? "";
 
   return {
     model: env.ADVISOR_MODEL?.trim() || "opus",
     maxCalls,
-    enabled: env.ADVISOR_ENABLED !== "false",
+    enabled: !DISABLED_VALUES.has(rawEnabled),
   };
 }
