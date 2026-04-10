@@ -53,3 +53,50 @@ test("loadConfig ADVISOR_ENABLED leaves the tool enabled otherwise", () => {
     );
   }
 });
+
+test("loadConfig transcript defaults: enabled, 24k chars, no sidechains, no thinking", () => {
+  const cfg = loadConfig({});
+  assert.equal(cfg.transcriptEnabled, true);
+  assert.equal(cfg.transcriptMaxChars, 24_000);
+  assert.equal(cfg.transcriptIncludeSidechains, false);
+  assert.equal(cfg.transcriptIncludeThinking, false);
+});
+
+test("loadConfig ADVISOR_TRANSCRIPT_ENABLED disables on the expected values", () => {
+  for (const value of ["false", "FALSE", "0", "no", "off"]) {
+    assert.equal(
+      loadConfig({ ADVISOR_TRANSCRIPT_ENABLED: value }).transcriptEnabled,
+      false,
+      `expected ${JSON.stringify(value)} to disable`,
+    );
+  }
+});
+
+test("loadConfig parses ADVISOR_TRANSCRIPT_MAX_CHARS", () => {
+  assert.equal(loadConfig({ ADVISOR_TRANSCRIPT_MAX_CHARS: "1000" }).transcriptMaxChars, 1000);
+  assert.equal(loadConfig({ ADVISOR_TRANSCRIPT_MAX_CHARS: "0" }).transcriptMaxChars, 0);
+});
+
+test("loadConfig rejects malformed ADVISOR_TRANSCRIPT_MAX_CHARS and falls back to default", () => {
+  assert.equal(loadConfig({ ADVISOR_TRANSCRIPT_MAX_CHARS: "abc" }).transcriptMaxChars, 24_000);
+  assert.equal(loadConfig({ ADVISOR_TRANSCRIPT_MAX_CHARS: "-1" }).transcriptMaxChars, 24_000);
+  assert.equal(loadConfig({ ADVISOR_TRANSCRIPT_MAX_CHARS: "1.5" }).transcriptMaxChars, 24_000);
+});
+
+test("loadConfig ADVISOR_TRANSCRIPT_INCLUDE_SIDECHAINS opts in", () => {
+  assert.equal(
+    loadConfig({ ADVISOR_TRANSCRIPT_INCLUDE_SIDECHAINS: "true" }).transcriptIncludeSidechains,
+    true,
+  );
+  assert.equal(
+    loadConfig({ ADVISOR_TRANSCRIPT_INCLUDE_SIDECHAINS: "false" }).transcriptIncludeSidechains,
+    false,
+  );
+});
+
+test("loadConfig ADVISOR_TRANSCRIPT_INCLUDE_THINKING opts in", () => {
+  assert.equal(
+    loadConfig({ ADVISOR_TRANSCRIPT_INCLUDE_THINKING: "true" }).transcriptIncludeThinking,
+    true,
+  );
+});
