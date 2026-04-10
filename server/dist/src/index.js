@@ -15,6 +15,12 @@ Respond in under 100 words using enumerated steps, not explanations. Focus on:
 
 Be direct. The agent will treat your guidance as authoritative.`;
 const TOOL_DESCRIPTION = "Consult a senior technical advisor (a stronger reasoning model) for strategic guidance. Provide your full task context, current approach, and any blockers. The advisor will review your work and respond with enumerated next steps. Use when choosing an approach on a non-trivial task, when stuck, when considering a change of direction, or before declaring done.";
+function textResult(text, isError = false) {
+    const result = { content: [{ type: "text", text }] };
+    if (isError)
+        result.isError = true;
+    return result;
+}
 function buildPrompt(context, question) {
     const parts = [
         ADVISOR_SYSTEM_PROMPT,
@@ -40,7 +46,9 @@ async function main() {
         inputSchema: {
             context: z
                 .string()
-                .min(1)
+                .refine((s) => s.trim().length > 0, {
+                message: "context must not be empty or whitespace-only",
+            })
                 .describe("Your current understanding of the task, what you've done so far, your planned approach, and what you need guidance on. Be thorough — the advisor only sees what you provide here."),
             question: z
                 .string()
@@ -49,57 +57,31 @@ async function main() {
         },
     }, async ({ context, question }) => {
         if (!config.enabled) {
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: "Advisor is disabled (ADVISOR_ENABLED=false). Proceed with your best judgment.",
-                    },
-                ],
-            };
+            return textResult("Advisor is disabled (ADVISOR_ENABLED=false). Proceed with your best judgment.");
         }
         if (callCount >= config.maxCalls) {
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: `Advisor budget exhausted (${config.maxCalls} calls used this session). Proceed with your best judgment, or ask the user to raise ADVISOR_MAX_CALLS if you need more consultations.`,
-                    },
-                ],
-            };
+            return textResult(`Advisor budget exhausted (${config.maxCalls} calls used this session). Proceed with your best judgment, or ask the user to raise ADVISOR_MAX_CALLS if you need more consultations.`);
         }
+        // Reserve the slot before awaiting so concurrent calls can't both pass
+        // the gate and overrun the budget. Failures still count — a flaky
+        // advisor shouldn't enable unbounded retries.
+        callCount += 1;
         const prompt = buildPrompt(context, question);
         try {
             const response = await runAdvisor({
                 model: config.model,
                 prompt,
             });
-            callCount += 1;
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: response,
-                    },
-                ],
-            };
+            return textResult(response);
         }
         catch (err) {
             const message = err instanceof Error ? err.message : String(err);
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: `Advisor call failed: ${message}\n\nProceed with your best judgment or retry with more context.`,
-                    },
-                ],
-                isError: true,
-            };
+            return textResult(`Advisor call failed: ${message}\n\nProceed with your best judgment or retry with more context.`, true);
         }
     });
+    process.stderr.write(`[bedrock-advisor] stdio server ready (model=${config.model}, maxCalls=${config.maxCalls}, enabled=${config.enabled})\n`);
     const transport = new StdioServerTransport();
     await server.connect(transport);
-    process.stderr.write(`[bedrock-advisor] stdio server ready (model=${config.model}, maxCalls=${config.maxCalls}, enabled=${config.enabled})\n`);
 }
 main().catch((err) => {
     process.stderr.write(`[bedrock-advisor] fatal: ${err instanceof Error ? err.stack ?? err.message : String(err)}\n`);

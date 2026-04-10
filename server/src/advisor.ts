@@ -19,25 +19,46 @@ export interface RunAdvisorOptions {
   spawner?: Spawner;
   /** Hard timeout in milliseconds. Defaults to 120000 (2 minutes). */
   timeoutMs?: number;
+  /** Cap on stdout+stderr bytes buffered. Defaults to 1 MiB. */
+  maxOutputBytes?: number;
 }
+
+/** Grace period between SIGTERM and SIGKILL when a timed-out child won't exit. */
+const SIGKILL_GRACE_MS = 5_000;
 
 /**
  * Invokes `claude -p --model <model>` as a subprocess, writes the prompt to
- * stdin, and resolves with the trimmed stdout. Rejects on non-zero exit or
- * timeout. No shell is used — args are passed as an array and the prompt is
- * streamed over stdin, so there are no escaping or argv length concerns.
+ * stdin, and resolves with the trimmed stdout. Rejects on non-zero exit,
+ * timeout, stdin write error, or output exceeding `maxOutputBytes`. No shell
+ * is used — args are passed as an array and the prompt is streamed over
+ * stdin, so there are no escaping or argv length concerns.
  */
 export function runAdvisor(opts: RunAdvisorOptions): Promise<string> {
-  const { model, prompt, spawner = spawn, timeoutMs = 120_000 } = opts;
+  const {
+    model,
+    prompt,
+    spawner = spawn,
+    timeoutMs = 120_000,
+    maxOutputBytes = 1 << 20,
+  } = opts;
 
   return new Promise((resolve, reject) => {
     const child = spawner("claude", ["-p", "--model", model], {
       stdio: ["pipe", "pipe", "pipe"],
     });
 
-    let stdout = "";
-    let stderr = "";
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    let bufferedBytes = 0;
     let settled = false;
+
+    const forceKill = (signal: NodeJS.Signals) => {
+      try {
+        child.kill(signal);
+      } catch {
+        // Child may already be gone; ignore.
+      }
+    };
 
     const settle = (fn: () => void) => {
       if (settled) return;
@@ -48,39 +69,57 @@ export function runAdvisor(opts: RunAdvisorOptions): Promise<string> {
 
     const timer = setTimeout(() => {
       settle(() => {
-        try {
-          child.kill("SIGTERM");
-        } catch {
-          // ignore
-        }
+        forceKill("SIGTERM");
+        setTimeout(() => forceKill("SIGKILL"), SIGKILL_GRACE_MS).unref();
         reject(new Error(`claude -p timed out after ${timeoutMs}ms`));
       });
     }, timeoutMs);
 
-    child.stdout?.on("data", (d: Buffer) => {
-      stdout += d.toString();
-    });
-    child.stderr?.on("data", (d: Buffer) => {
-      stderr += d.toString();
-    });
+    const capture = (chunks: Buffer[], d: Buffer) => {
+      bufferedBytes += d.length;
+      if (bufferedBytes > maxOutputBytes) {
+        settle(() => {
+          forceKill("SIGKILL");
+          reject(
+            new Error(
+              `claude -p output exceeded ${maxOutputBytes} bytes — aborting`,
+            ),
+          );
+        });
+        return;
+      }
+      chunks.push(d);
+    };
+
+    child.stdout?.on("data", (d: Buffer) => capture(stdoutChunks, d));
+    child.stderr?.on("data", (d: Buffer) => capture(stderrChunks, d));
     child.on("error", (err) => {
       settle(() => reject(err));
     });
     child.on("close", (code) => {
       settle(() => {
+        const stdout = Buffer.concat(stdoutChunks).toString().trim();
         if (code === 0) {
-          resolve(stdout.trim());
+          if (stdout.length === 0) {
+            reject(new Error("claude -p exited 0 with no output"));
+          } else {
+            resolve(stdout);
+          }
         } else {
-          const msg = stderr.trim() || stdout.trim() || "(no output)";
+          const stderr = Buffer.concat(stderrChunks).toString().trim();
+          const msg = stderr || stdout || "(no output)";
           reject(new Error(`claude -p exited ${code}: ${msg}`));
         }
       });
     });
 
-    if (child.stdin) {
-      child.stdin.end(prompt);
-    } else {
+    if (!child.stdin) {
       settle(() => reject(new Error("spawned process has no stdin")));
+      return;
     }
+    // EPIPE is expected if the child exits before reading all of stdin; without
+    // a listener Node crashes the whole process.
+    child.stdin.on("error", (err) => settle(() => reject(err)));
+    child.stdin.end(prompt);
   });
 }
