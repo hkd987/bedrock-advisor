@@ -20,13 +20,10 @@ function parseNonNegativeInt(raw, defaultValue) {
     return Number.isInteger(parsed) && parsed >= 0 ? parsed : defaultValue;
 }
 export function loadConfig(env = process.env) {
-    const rawEnabled = env.ADVISOR_ENABLED?.trim().toLowerCase() ?? "";
-    // Preserve v0.1 semantics: a blank `ADVISOR_ENABLED` leaves the tool enabled.
-    const enabled = !DISABLED_VALUES.has(rawEnabled);
     return {
         model: env.ADVISOR_MODEL?.trim() || "opus",
         maxCalls: parseNonNegativeInt(env.ADVISOR_MAX_CALLS, DEFAULT_MAX_CALLS),
-        enabled,
+        enabled: parseBoolean(env.ADVISOR_ENABLED, true),
         transcriptEnabled: parseBoolean(env.ADVISOR_TRANSCRIPT_ENABLED, true),
         transcriptMaxChars: parseNonNegativeInt(env.ADVISOR_TRANSCRIPT_MAX_CHARS, DEFAULT_TRANSCRIPT_MAX_CHARS),
         transcriptIncludeSidechains: parseBoolean(env.ADVISOR_TRANSCRIPT_INCLUDE_SIDECHAINS, false),

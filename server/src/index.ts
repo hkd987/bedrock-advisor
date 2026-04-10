@@ -3,15 +3,14 @@ import { pathToFileURL } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { loadConfig, type AdvisorConfig } from "./config.js";
+import { loadConfig } from "./config.js";
 import { runAdvisor } from "./advisor.js";
 import {
   MAX_CHARS_PER_MESSAGE,
   MAX_CHARS_PER_TOOL_RESULT,
   filterEntries,
-  formatTranscript,
   readTranscript,
-  selectTailWithinBudget,
+  renderTail,
   validateTranscriptPath,
 } from "./transcript.js";
 
@@ -42,17 +41,19 @@ function textResult(text: string, isError = false): ToolResult {
   return result;
 }
 
+export interface BuildPromptOptions {
+  context: string;
+  question?: string;
+  transcript: string | null;
+}
+
 /**
  * Assembles the prompt piped to `claude -p`. Section order is deliberate:
- * the engineer's framing establishes the frame, the transcript provides
- * (untrusted) evidence, and the specific question lands last so the model
- * weights it most heavily.
+ * engineer framing first, then (untrusted) transcript evidence, then the
+ * specific question — the model weights the most recent section most
+ * heavily.
  */
-export function buildPrompt(
-  context: string,
-  question: string | undefined,
-  transcript: string | null,
-): string {
+export function buildPrompt({ context, question, transcript }: BuildPromptOptions): string {
   const parts = [
     ADVISOR_SYSTEM_PROMPT,
     "",
@@ -72,43 +73,43 @@ export function buildPrompt(
   return parts.join("\n");
 }
 
+export interface TranscriptLoadOptions {
+  maxChars: number;
+  includeSidechains: boolean;
+  includeThinking: boolean;
+}
+
+export interface TranscriptLoadResult {
+  transcript: string | null;
+  /** Human-readable reason transcript was skipped — caller chooses whether to log. */
+  warning?: string;
+}
+
 /**
- * Reads, filters, selects, and formats the transcript at `path`. Returns
- * null on any failure — callers should fall back to a transcript-less prompt.
- * Errors are logged to stderr as a single prefixed line, never thrown.
+ * Reads, filters, and renders the transcript at `path`. Returns a result
+ * struct rather than throwing; the caller decides whether to log warnings.
+ * The advisor tool call must never be failed due to transcript loading.
  */
 export async function loadTranscriptSafely(
   rawPath: string,
-  config: AdvisorConfig,
-): Promise<string | null> {
+  opts: TranscriptLoadOptions,
+): Promise<TranscriptLoadResult> {
   try {
     const safePath = validateTranscriptPath(rawPath);
-    if (!safePath) {
-      process.stderr.write(
-        `[bedrock-advisor] transcript unavailable: path rejected by validator\n`,
-      );
-      return null;
-    }
+    if (!safePath) return { transcript: null, warning: "path rejected by validator" };
+
     const entries = await readTranscript(safePath);
-    const filtered = filterEntries(entries, {
-      includeSidechains: config.transcriptIncludeSidechains,
-    });
-    const formatOpts = {
+    const filtered = filterEntries(entries, { includeSidechains: opts.includeSidechains });
+    const rendered = renderTail(filtered, opts.maxChars, {
       maxCharsPerMessage: MAX_CHARS_PER_MESSAGE,
       maxCharsPerToolResult: MAX_CHARS_PER_TOOL_RESULT,
-      includeThinking: config.transcriptIncludeThinking,
-    };
-    const selected = selectTailWithinBudget(
-      filtered,
-      config.transcriptMaxChars,
-      formatOpts,
-    );
-    if (selected.length === 0) return null;
-    return formatTranscript(selected, formatOpts);
+      includeThinking: opts.includeThinking,
+    });
+    if (rendered.length === 0) return { transcript: null };
+    return { transcript: rendered.join("\n\n") };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    process.stderr.write(`[bedrock-advisor] transcript unavailable: ${message}\n`);
-    return null;
+    return { transcript: null, warning: message };
   }
 }
 
@@ -144,9 +145,7 @@ async function main() {
         _transcript_path: z
           .string()
           .optional()
-          .describe(
-            "INTERNAL: populated automatically by the plugin's PreToolUse hook. Do not set manually.",
-          ),
+          .describe("Reserved for internal use. Do not set."),
       },
     },
     async ({ context, question, _transcript_path }) => {
@@ -169,10 +168,20 @@ async function main() {
 
       let transcript: string | null = null;
       if (config.transcriptEnabled && _transcript_path) {
-        transcript = await loadTranscriptSafely(_transcript_path, config);
+        const result = await loadTranscriptSafely(_transcript_path, {
+          maxChars: config.transcriptMaxChars,
+          includeSidechains: config.transcriptIncludeSidechains,
+          includeThinking: config.transcriptIncludeThinking,
+        });
+        transcript = result.transcript;
+        if (result.warning) {
+          process.stderr.write(
+            `[bedrock-advisor] transcript unavailable: ${result.warning}\n`,
+          );
+        }
       }
 
-      const prompt = buildPrompt(context, question, transcript);
+      const prompt = buildPrompt({ context, question, transcript });
 
       try {
         const response = await runAdvisor({

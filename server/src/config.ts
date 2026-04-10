@@ -43,14 +43,10 @@ function parseNonNegativeInt(raw: string | undefined, defaultValue: number): num
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AdvisorConfig {
-  const rawEnabled = env.ADVISOR_ENABLED?.trim().toLowerCase() ?? "";
-  // Preserve v0.1 semantics: a blank `ADVISOR_ENABLED` leaves the tool enabled.
-  const enabled = !DISABLED_VALUES.has(rawEnabled);
-
   return {
     model: env.ADVISOR_MODEL?.trim() || "opus",
     maxCalls: parseNonNegativeInt(env.ADVISOR_MAX_CALLS, DEFAULT_MAX_CALLS),
-    enabled,
+    enabled: parseBoolean(env.ADVISOR_ENABLED, true),
     transcriptEnabled: parseBoolean(env.ADVISOR_TRANSCRIPT_ENABLED, true),
     transcriptMaxChars: parseNonNegativeInt(
       env.ADVISOR_TRANSCRIPT_MAX_CHARS,

@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { resolve, sep } from "node:path";
+import { extname, resolve, sep } from "node:path";
 
 /**
  * Transcript injection for the advisor.
@@ -8,33 +8,53 @@ import { resolve, sep } from "node:path";
  * The MCP server has no direct access to the current Claude Code session's
  * conversation. A PreToolUse hook bundled with the plugin injects the
  * session's `transcript_path` into the tool call; this module reads the
- * resulting JSONL file, filters and truncates it, and renders a string
+ * resulting JSONL file, filters and truncates it, and produces a string
  * that `buildPrompt` appends to the advisor prompt as untrusted evidence.
  *
- * Design constraints (see /root/.claude/plans/dynamic-riding-tiger.md):
- *   - Must degrade cleanly — never throw into the handler path.
+ * Design notes (see /root/.claude/plans/dynamic-riding-tiger.md):
+ *   - Never throws into the handler path — callers must tolerate null.
  *   - Path reads are restricted to `~/.claude/projects/**.jsonl`.
  *   - Prior `mcp__advisor__consult` tool_use/tool_result pairs are filtered
- *     out to avoid echo chambers and reclaim budget.
- *   - Budgets are conservative to keep per-call cost sane; see README.
+ *     out to avoid echo chambers.
  *   - Tool-result content is fenced with XML-ish markers so the advisor's
  *     system prompt can label it as untrusted.
  */
 
-/** Per-block char cap for text and thinking blocks. */
 export const MAX_CHARS_PER_MESSAGE = 2_000;
-/** Tighter cap for tool_result content (file reads, shell output dominate bloat). */
 export const MAX_CHARS_PER_TOOL_RESULT = 1_500;
+
 /** Soft-overrun allowance when a tool_result pulls in its preceding tool_use past budget. */
 const BUDGET_OVERRUN_GRACE = 0.1;
+
+/**
+ * Defensive cap on lines parsed from a transcript. Even a 24k-char budget
+ * can't fit anywhere near this many entries, so parsing the prefix is pure
+ * waste on pathologically long sessions.
+ */
+const MAX_LINES_READ = 10_000;
 
 /** MCP tool name for the advisor itself — filtered to avoid echo chambers. */
 const ADVISOR_TOOL_NAME = "mcp__advisor__consult";
 
-/**
- * Shape of a single parsed JSONL line. We only model the fields we consume;
- * everything else stays as `unknown` and is ignored.
- */
+// -----------------------------------------------------------------------------
+// Block types — narrow once at the boundary so walkers don't repeat casts.
+// -----------------------------------------------------------------------------
+
+type TextBlock = { type: "text"; text?: string };
+type ThinkingBlock = { type: "thinking"; thinking?: string };
+type ToolUseBlock = { type: "tool_use"; id?: string; name?: string; input?: unknown };
+type ToolResultBlock = {
+  type: "tool_result";
+  tool_use_id?: string;
+  content?: unknown;
+  is_error?: boolean;
+};
+type Block = TextBlock | ThinkingBlock | ToolUseBlock | ToolResultBlock | { type?: string };
+
+function asBlock(x: unknown): Block | null {
+  return x && typeof x === "object" ? (x as Block) : null;
+}
+
 export interface RawEntry {
   type?: string;
   isSidechain?: boolean;
@@ -42,7 +62,6 @@ export interface RawEntry {
     role?: string;
     content?: unknown;
   };
-  [k: string]: unknown;
 }
 
 export interface FilterOptions {
@@ -55,37 +74,39 @@ export interface FormatOptions {
   includeThinking: boolean;
 }
 
+// -----------------------------------------------------------------------------
+// Path validation
+// -----------------------------------------------------------------------------
+
 /**
- * Validates a hook-provided transcript path. Returns a resolved absolute path
- * under `~/.claude/projects/` ending in `.jsonl`, or null if rejected.
- *
- * Defense in depth: even if a prompt-injected `_transcript_path` lands in the
- * tool input (hook bypass, misconfiguration), this check prevents the server
- * from reading arbitrary files.
+ * Returns a sanitized absolute path under `~/.claude/projects/` ending in
+ * `.jsonl`, or null if rejected. Defense in depth against a prompt-injected
+ * `_transcript_path` override.
  */
 export function validateTranscriptPath(input: string): string | null {
   if (typeof input !== "string" || input.length === 0) return null;
-  let absolute: string;
-  try {
-    absolute = resolve(input);
-  } catch {
-    return null;
-  }
-  if (!absolute.endsWith(".jsonl")) return null;
+  const absolute = resolve(input);
+  if (extname(absolute) !== ".jsonl") return null;
   const projectsRoot = resolve(homedir(), ".claude", "projects") + sep;
   if (!absolute.startsWith(projectsRoot)) return null;
   return absolute;
 }
 
+// -----------------------------------------------------------------------------
+// File read
+// -----------------------------------------------------------------------------
+
 /**
- * Reads a JSONL transcript file and returns one entry per parseable line.
  * Unparseable lines (e.g. a partial trailing line from an in-progress write)
- * are skipped silently rather than aborting the read.
+ * are skipped silently — the next advisor call picks them up.
  */
 export async function readTranscript(path: string): Promise<RawEntry[]> {
   const raw = await readFile(path, "utf8");
+  const allLines = raw.split("\n");
+  const lines =
+    allLines.length > MAX_LINES_READ ? allLines.slice(-MAX_LINES_READ) : allLines;
   const out: RawEntry[] = [];
-  for (const line of raw.split("\n")) {
+  for (const line of lines) {
     if (line.length === 0) continue;
     try {
       const parsed = JSON.parse(line);
@@ -93,22 +114,24 @@ export async function readTranscript(path: string): Promise<RawEntry[]> {
         out.push(parsed as RawEntry);
       }
     } catch {
-      // Skip partial / malformed lines — next call will pick them up.
+      // Skip partial / malformed lines.
     }
   }
   return out;
 }
 
+// -----------------------------------------------------------------------------
+// Filtering
+// -----------------------------------------------------------------------------
+
 /**
  * Filters entries to the set the advisor should see:
- *   - keeps only user/assistant message entries (drops `queue-operation`, etc.)
+ *   - keeps only user/assistant messages (drops queue-operation, etc.)
  *   - drops sidechain (sub-agent) entries unless explicitly included
- *   - drops both halves of any prior `mcp__advisor__consult` tool_use/tool_result pair
+ *   - drops both halves of any prior `mcp__advisor__consult` pair
  *
- * The self-reference filter walks the entries linearly: an assistant message
- * whose content consists only of tool_use blocks targeting the advisor is
- * dropped, and its tool_use ids are remembered so the matching tool_result
- * entries (on subsequent user turns) can be dropped too.
+ * Entries are returned by reference when no blocks were dropped — only
+ * entries that actually lost blocks get a shallow copy.
  */
 export function filterEntries(entries: RawEntry[], opts: FilterOptions): RawEntry[] {
   const advisorToolUseIds = new Set<string>();
@@ -120,131 +143,137 @@ export function filterEntries(entries: RawEntry[], opts: FilterOptions): RawEntr
 
     const content = entry.message?.content;
 
-    // String content (simple user prompt) always passes.
     if (typeof content === "string") {
       out.push(entry);
       continue;
     }
     if (!Array.isArray(content)) continue;
 
-    // Track advisor tool_use ids so we can drop their tool_result counterparts.
-    for (const block of content) {
-      if (
-        block &&
-        typeof block === "object" &&
-        (block as { type?: string }).type === "tool_use" &&
-        (block as { name?: string }).name === ADVISOR_TOOL_NAME
-      ) {
-        const id = (block as { id?: string }).id;
+    // First pass: collect advisor tool_use ids so we can drop their
+    // tool_result counterparts alongside the tool_use itself.
+    for (const raw of content) {
+      const b = asBlock(raw);
+      if (b?.type === "tool_use" && (b as ToolUseBlock).name === ADVISOR_TOOL_NAME) {
+        const id = (b as ToolUseBlock).id;
         if (typeof id === "string") advisorToolUseIds.add(id);
       }
     }
 
-    // Strip advisor-related blocks from the content; drop the entry if empty.
-    const keptBlocks = content.filter((block) => {
-      if (!block || typeof block !== "object") return false;
-      const b = block as { type?: string; name?: string; tool_use_id?: string };
-      if (b.type === "tool_use" && b.name === ADVISOR_TOOL_NAME) return false;
-      if (b.type === "tool_result" && typeof b.tool_use_id === "string" && advisorToolUseIds.has(b.tool_use_id)) {
-        return false;
+    // Second pass: keep everything that isn't an advisor block.
+    const keptBlocks: unknown[] = [];
+    for (const raw of content) {
+      const b = asBlock(raw);
+      if (!b) continue;
+      if (b.type === "tool_use" && (b as ToolUseBlock).name === ADVISOR_TOOL_NAME) continue;
+      if (b.type === "tool_result") {
+        const id = (b as ToolResultBlock).tool_use_id;
+        if (typeof id === "string" && advisorToolUseIds.has(id)) continue;
       }
-      return true;
-    });
+      keptBlocks.push(raw);
+    }
 
     if (keptBlocks.length === 0) continue;
-
-    // Rebuild a shallow copy with the filtered content; don't mutate input.
-    out.push({
-      ...entry,
-      message: { ...entry.message, content: keptBlocks },
-    });
+    if (keptBlocks.length === content.length) {
+      out.push(entry);
+      continue;
+    }
+    out.push({ ...entry, message: { ...entry.message, content: keptBlocks } });
   }
 
   return out;
 }
 
+// -----------------------------------------------------------------------------
+// Tail selection + rendering (single pass)
+// -----------------------------------------------------------------------------
+
 /**
- * Walks entries from the tail backward, accumulating rendered size, and
- * returns the suffix that fits within `charBudget`. If the newly included
- * entry would leave an orphaned `tool_result` (i.e. its producing `tool_use`
- * in a preceding assistant turn didn't make the cut), the preceding entry is
- * pulled in even if it pushes slightly over budget.
+ * Walks entries from the tail backward, rendering each as it goes, and
+ * returns the suffix (in chronological order) whose total rendered size
+ * fits within `charBudget`. An orphaned `tool_result` at the budget
+ * boundary pulls in its producing `tool_use` even if that pushes slightly
+ * past the soft budget.
  *
- * Returns entries in chronological order.
+ * Single-pass render: each kept entry is rendered exactly once, and
+ * nothing outside the kept tail is rendered at all. On long sessions this
+ * turns O(N) render work into O(kept) — the whole point of the refactor
+ * that collapsed the old `selectTailWithinBudget` + `formatTranscript`
+ * pair.
  */
-export function selectTailWithinBudget(
+export function renderTail(
   entries: RawEntry[],
   charBudget: number,
-  formatOpts: FormatOptions,
-): RawEntry[] {
+  opts: FormatOptions,
+): string[] {
   if (charBudget <= 0 || entries.length === 0) return [];
-
-  // Pre-render each entry in isolation so we can measure size cheaply.
-  const rendered = entries.map((e) => renderEntry(e, formatOpts));
-  const selectedIndexes: number[] = [];
-  let total = 0;
   const hardCap = Math.floor(charBudget * (1 + BUDGET_OVERRUN_GRACE));
 
+  const selected: Array<{ index: number; text: string }> = [];
+  let total = 0;
+
   for (let i = entries.length - 1; i >= 0; i--) {
-    const size = rendered[i]!.length;
-    if (total + size > charBudget) {
-      // No more room. But: if the first entry we already included was a
-      // tool_result, try to also include this entry if it's the matching
-      // tool_use and we're still within the soft-overrun grace.
+    const text = renderEntry(entries[i]!, opts);
+    if (total + text.length > charBudget) {
+      // Orphan rescue: if the most recently selected entry is a tool_result
+      // whose producing tool_use lives in this entry, pull this entry in
+      // even though we're over budget (up to the soft-cap grace).
+      const newest = selected[selected.length - 1];
       if (
-        selectedIndexes.length > 0 &&
-        entryProducesOrphanWith(entries[selectedIndexes[selectedIndexes.length - 1]!]!, entries[i]!) &&
-        total + size <= hardCap
+        newest &&
+        total + text.length <= hardCap &&
+        earlierContainsToolUseFor(entries[i]!, entries[newest.index]!)
       ) {
-        selectedIndexes.push(i);
-        total += size;
+        selected.push({ index: i, text });
       }
       break;
     }
-    selectedIndexes.push(i);
-    total += size;
+    selected.push({ index: i, text });
+    total += text.length;
   }
 
-  return selectedIndexes.reverse().map((i) => entries[i]!);
+  return selected.reverse().map((s) => s.text);
 }
 
 /**
- * Returns true if `earlier` contains a `tool_use` whose id matches a
- * `tool_result.tool_use_id` in `later`. Used to avoid stranding a tool_result
- * without its producing tool_use when the budget cut falls mid-pair.
+ * True if `earlier` contains a `tool_use` whose id matches a
+ * `tool_result.tool_use_id` in `later`. Used once per `renderTail`
+ * invocation at the budget boundary, not in a hot loop.
  */
-function entryProducesOrphanWith(later: RawEntry, earlier: RawEntry): boolean {
+function earlierContainsToolUseFor(earlier: RawEntry, later: RawEntry): boolean {
   const laterContent = later.message?.content;
   const earlierContent = earlier.message?.content;
   if (!Array.isArray(laterContent) || !Array.isArray(earlierContent)) return false;
 
   const laterToolResultIds = new Set<string>();
-  for (const block of laterContent) {
-    if (block && typeof block === "object") {
-      const b = block as { type?: string; tool_use_id?: string };
-      if (b.type === "tool_result" && typeof b.tool_use_id === "string") {
-        laterToolResultIds.add(b.tool_use_id);
-      }
+  for (const raw of laterContent) {
+    const b = asBlock(raw);
+    if (b?.type === "tool_result") {
+      const id = (b as ToolResultBlock).tool_use_id;
+      if (typeof id === "string") laterToolResultIds.add(id);
     }
   }
   if (laterToolResultIds.size === 0) return false;
 
-  for (const block of earlierContent) {
-    if (block && typeof block === "object") {
-      const b = block as { type?: string; id?: string };
-      if (b.type === "tool_use" && typeof b.id === "string" && laterToolResultIds.has(b.id)) {
-        return true;
-      }
+  for (const raw of earlierContent) {
+    const b = asBlock(raw);
+    if (b?.type === "tool_use") {
+      const id = (b as ToolUseBlock).id;
+      if (typeof id === "string" && laterToolResultIds.has(id)) return true;
     }
   }
   return false;
 }
 
+// -----------------------------------------------------------------------------
+// Per-entry rendering
+// -----------------------------------------------------------------------------
+
 /**
- * Renders a single entry as a plain-text block with injection-safe markers.
- * Tool results are fenced so the advisor's system prompt can disclaim them.
+ * Renders a single entry with injection-safe markers. Tool results are
+ * fenced so the advisor's system prompt can disclaim them as untrusted.
+ * Exported for tests; the hot path goes through `renderTail`.
  */
-function renderEntry(entry: RawEntry, opts: FormatOptions): string {
+export function renderEntry(entry: RawEntry, opts: FormatOptions): string {
   const role = entry.message?.role;
   const content = entry.message?.content;
 
@@ -254,76 +283,70 @@ function renderEntry(entry: RawEntry, opts: FormatOptions): string {
   if (typeof content === "string") {
     parts.push(truncate(content, opts.maxCharsPerMessage));
   } else if (Array.isArray(content)) {
-    for (const block of content) {
-      if (!block || typeof block !== "object") continue;
-      const b = block as {
-        type?: string;
-        text?: string;
-        thinking?: string;
-        name?: string;
-        input?: unknown;
-        content?: unknown;
-        is_error?: boolean;
-      };
+    for (const raw of content) {
+      const b = asBlock(raw);
+      if (!b) continue;
       switch (b.type) {
         case "text": {
-          if (typeof b.text === "string") {
-            parts.push(truncate(b.text, opts.maxCharsPerMessage));
+          const text = (b as TextBlock).text;
+          if (typeof text === "string") {
+            parts.push(truncate(text, opts.maxCharsPerMessage));
           }
           break;
         }
         case "thinking": {
-          if (opts.includeThinking && typeof b.thinking === "string") {
+          if (!opts.includeThinking) break;
+          const thinking = (b as ThinkingBlock).thinking;
+          if (typeof thinking === "string") {
             parts.push("[thinking]");
-            parts.push(truncate(b.thinking, opts.maxCharsPerMessage));
+            parts.push(truncate(thinking, opts.maxCharsPerMessage));
           }
           break;
         }
         case "tool_use": {
-          const name = typeof b.name === "string" ? b.name : "unknown";
-          let inputStr: string;
-          try {
-            inputStr = JSON.stringify(b.input ?? {});
-          } catch {
-            inputStr = "<unserializable>";
-          }
+          const tu = b as ToolUseBlock;
+          const name = typeof tu.name === "string" ? tu.name : "unknown";
           parts.push(`### tool_use: ${name}`);
-          parts.push(`input: ${truncate(inputStr, opts.maxCharsPerMessage)}`);
+          // `tu.input` came from JSON.parse via readTranscript, so it's
+          // guaranteed acyclic — JSON.stringify cannot throw here.
+          parts.push(`input: ${truncate(JSON.stringify(tu.input ?? {}), opts.maxCharsPerMessage)}`);
           break;
         }
         case "tool_result": {
-          const text = toolResultToText(b.content);
-          const isError = b.is_error === true ? "true" : "false";
+          const tr = b as ToolResultBlock;
+          const text = toolResultToText(tr.content);
+          const isError = tr.is_error === true ? "true" : "false";
           parts.push(`<tool_result is_error="${isError}">`);
           parts.push(truncate(text, opts.maxCharsPerToolResult));
           parts.push("</tool_result>");
           break;
         }
-        default:
-          // Unknown block types are silently dropped.
-          break;
       }
     }
   }
 
-  // If a content array had only filtered-out blocks (e.g. just thinking), we
-  // still return the heading — but the entry would already have been dropped
-  // by filterEntries in that case, so it won't reach here for advisor calls.
   return parts.join("\n");
 }
 
 /**
- * Normalizes a `tool_result.content` to a plain string. It may be a string
- * or an array of `{type: "text", text}` blocks depending on the producer.
+ * Thin test helper that renders a list of entries and joins them with
+ * blank-line separators. The production hot path calls `renderTail`
+ * directly and joins the result itself.
  */
+export function formatTranscript(entries: RawEntry[], opts: FormatOptions): string {
+  return entries.map((e) => renderEntry(e, opts)).join("\n\n");
+}
+
+/** Normalizes a `tool_result.content` (string or array of text blocks) to a plain string. */
 function toolResultToText(content: unknown): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
     const pieces: string[] = [];
-    for (const block of content) {
-      if (block && typeof block === "object") {
-        const b = block as { type?: string; text?: string };
-        if (b.type === "text" && typeof b.text === "string") pieces.push(b.text);
+    for (const raw of content) {
+      const b = asBlock(raw);
+      if (b?.type === "text") {
+        const text = (b as TextBlock).text;
+        if (typeof text === "string") pieces.push(text);
       }
     }
     return pieces.join("\n");
@@ -333,16 +356,5 @@ function toolResultToText(content: unknown): string {
 
 function truncate(s: string, cap: number): string {
   if (s.length <= cap) return s;
-  const dropped = s.length - cap;
-  return s.slice(0, cap) + `\n[… truncated ${dropped} chars]`;
-}
-
-/**
- * Renders the final transcript string that `buildPrompt` will embed under
- * the "Recent conversation" section. Entries should already be filtered and
- * selected; this just emits them with blank-line separators.
- */
-export function formatTranscript(entries: RawEntry[], opts: FormatOptions): string {
-  if (entries.length === 0) return "";
-  return entries.map((e) => renderEntry(e, opts)).join("\n\n");
+  return s.slice(0, cap) + `\n[… truncated ${s.length - cap} chars]`;
 }

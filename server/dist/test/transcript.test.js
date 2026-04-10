@@ -5,7 +5,7 @@ import { tmpdir, homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 const HERE = dirname(fileURLToPath(import.meta.url));
-import { MAX_CHARS_PER_MESSAGE, MAX_CHARS_PER_TOOL_RESULT, filterEntries, formatTranscript, readTranscript, selectTailWithinBudget, validateTranscriptPath, } from "../src/transcript.js";
+import { MAX_CHARS_PER_MESSAGE, MAX_CHARS_PER_TOOL_RESULT, filterEntries, formatTranscript, readTranscript, renderTail, validateTranscriptPath, } from "../src/transcript.js";
 const DEFAULT_FORMAT_OPTS = {
     maxCharsPerMessage: MAX_CHARS_PER_MESSAGE,
     maxCharsPerToolResult: MAX_CHARS_PER_TOOL_RESULT,
@@ -322,9 +322,9 @@ test("formatTranscript renders tool_use blocks with name and input JSON", () => 
     assert.match(out, /"command":"ls -la"/);
 });
 // -----------------------------------------------------------------------------
-// selectTailWithinBudget
+// renderTail
 // -----------------------------------------------------------------------------
-test("selectTailWithinBudget returns the tail that fits", () => {
+test("renderTail returns the tail that fits, most-recent preserved", () => {
     const entries = [];
     for (let i = 0; i < 10; i++) {
         entries.push({
@@ -333,30 +333,26 @@ test("selectTailWithinBudget returns the tail that fits", () => {
         });
     }
     // Each rendered entry is ~90 chars. Budget of 300 should keep roughly 3.
-    const selected = selectTailWithinBudget(entries, 300, DEFAULT_FORMAT_OPTS);
-    assert.ok(selected.length >= 2 && selected.length <= 4, `got ${selected.length}`);
-    // And they should be the MOST RECENT ones.
-    const lastContent = selected[selected.length - 1].message.content;
-    assert.match(lastContent, /entry 9/);
+    const rendered = renderTail(entries, 300, DEFAULT_FORMAT_OPTS);
+    assert.ok(rendered.length >= 2 && rendered.length <= 4, `got ${rendered.length}`);
+    assert.match(rendered[rendered.length - 1], /entry 9/);
 });
-test("selectTailWithinBudget returns [] for a zero budget", () => {
+test("renderTail returns [] for a zero budget", () => {
     const entries = [
         { type: "user", message: { role: "user", content: "hi" } },
     ];
-    assert.deepEqual(selectTailWithinBudget(entries, 0, DEFAULT_FORMAT_OPTS), []);
+    assert.deepEqual(renderTail(entries, 0, DEFAULT_FORMAT_OPTS), []);
 });
-test("selectTailWithinBudget returns [] for empty input", () => {
-    assert.deepEqual(selectTailWithinBudget([], 1000, DEFAULT_FORMAT_OPTS), []);
+test("renderTail returns [] for empty input", () => {
+    assert.deepEqual(renderTail([], 1000, DEFAULT_FORMAT_OPTS), []);
 });
-test("selectTailWithinBudget pulls in a preceding tool_use to avoid orphan tool_result", () => {
+test("renderTail pulls in a preceding tool_use to avoid orphan tool_result", () => {
     // Craft a history where the budget would otherwise include the tool_result
     // but not its producing tool_use. The orphan-avoidance rule should pull
     // the tool_use in, even slightly past the soft budget.
     const bigPad = "x".repeat(600);
     const entries = [
-        // Older padding entries so there's context to drop
         { type: "user", message: { role: "user", content: `old ${bigPad}` } },
-        // The producing tool_use
         {
             type: "assistant",
             message: {
@@ -371,7 +367,6 @@ test("selectTailWithinBudget pulls in a preceding tool_use to avoid orphan tool_
                 ],
             },
         },
-        // The matching tool_result
         {
             type: "user",
             message: {
@@ -388,15 +383,10 @@ test("selectTailWithinBudget pulls in a preceding tool_use to avoid orphan tool_
         },
     ];
     // Budget small enough to reject the padding but big enough for the pair.
-    const selected = selectTailWithinBudget(entries, 200, DEFAULT_FORMAT_OPTS);
-    // Must NOT include the padding, MUST include both halves of the pair.
-    assert.ok(selected.length >= 2, `got ${selected.length}`);
-    const hasToolUse = selected.some((e) => Array.isArray(e.message?.content) &&
-        e.message.content.some((b) => b.type === "tool_use"));
-    const hasToolResult = selected.some((e) => Array.isArray(e.message?.content) &&
-        e.message.content.some((b) => b.type === "tool_result"));
-    assert.ok(hasToolUse, "expected tool_use to be pulled in");
-    assert.ok(hasToolResult, "expected tool_result to remain");
+    const rendered = renderTail(entries, 200, DEFAULT_FORMAT_OPTS);
+    assert.ok(rendered.length >= 2, `got ${rendered.length}`);
+    assert.ok(rendered.some((r) => /### tool_use: Bash/.test(r)), "expected tool_use");
+    assert.ok(rendered.some((r) => /<tool_result/.test(r)), "expected tool_result");
 });
 // -----------------------------------------------------------------------------
 // Golden fixture test
