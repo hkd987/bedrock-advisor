@@ -1,0 +1,13 @@
+{
+  "name": "bedrock-advisor",
+  "owner": {
+    "name": "hkd987"
+  },
+  "plugins": [
+    {
+      "name": "bedrock-advisor",
+      "source": ".",
+      "description": "Sonnet consults Opus on-demand — advisor tool pattern for Claude Code on Bedrock, Vertex, and Foundry."
+    }
+  ]
+}

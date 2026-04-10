@@ -1,0 +1,12 @@
+{
+  "name": "bedrock-advisor",
+  "version": "0.1.0",
+  "description": "Client-side replica of Anthropic's advisor tool for Claude Code on Bedrock, Vertex, and Foundry. Sonnet consults Opus on-demand via a local MCP tool.",
+  "author": {
+    "name": "hkd987"
+  },
+  "homepage": "https://github.com/hkd987/bedrock-advisor",
+  "repository": "https://github.com/hkd987/bedrock-advisor",
+  "license": "MIT",
+  "keywords": ["claude-code", "mcp", "bedrock", "advisor", "opus"]
+}
